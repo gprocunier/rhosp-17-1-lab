@@ -1,0 +1,234 @@
+---
+- name: create rhos-17-1 standalone vm
+  hosts: localhost
+  connection: local
+  vars:
+    # change these 3 folders to your deployment
+    project_dir: '/home/greg'
+    # folder with source images
+    images_dir: '/images/source'
+    # folder with generated vm disks
+    guest_dir: '/images/guests'
+    os: 'rhel9.2'
+    os_image: 'rhel-9.2-x86_64-kvm.qcow2'
+    ssh_pubkey: '{{ lookup("file", "{{ project_dir }}/.ssh/id_ed25519.pub") }}'
+    ssh_privatekey: '{{ lookup("file", "{{ project_dir }}/.ssh/id_ed25519") }}'
+    subdomain: home.lan
+    root_password: 'redhat'
+    public_network: 'virbr1'
+    deploy_targets:
+      - name: rhos-17-1
+        machine: pc-q35-8.2
+        vcpus: 10
+        memory: 32768
+        root_disk_size: 128G
+        network:
+          - "{{ public_network }}"
+        network_config:
+          version: 2
+          renderer: NetworkManager
+          ethernets:
+            eth0:
+              match:
+                name: en*
+              set-name: eth0
+              addresses:
+                - 10.10.1.5/24
+              routes:
+                - to: 0.0.0.0/0
+                  via: 10.10.1.1
+              nameservers:
+                addresses:
+                  - 10.10.0.1
+        extra_disk:
+          - name: rhos-17-1-swap.img
+            type: raw
+            size: 32G
+          - name: rhos-17-1-ceph-data.qcow2
+            type: qcow2
+            size: 128G
+            options: "-o compression_type=zstd"
+        user_data:
+          # groups:
+          #  sudo:
+          #    - cloud-user
+          users:
+            - name: root
+              lock_passwd: false
+              hashed_passwd: "{{ root_password | password_hash('sha512') }}"
+            - name: cloud-user
+              ssh_authorized_keys:
+                - "{{ ssh_pubkey }}"
+              sudo:  'ALL=(ALL) NOPASSWD: ALL'
+              shell: /bin/bash
+          write_files:
+            - path: /etc/hosts
+              content: |
+                10.10.1.5         rhos-17-1.home.lan rhos-17-1
+              append: true
+          runcmd:
+            - parted /dev/sdb mklabel gpt mkpart primary linux-swap 0% 100%
+            - mkswap /dev/sdb1
+            - echo -e "[Swap]\nWhat=/dev/sdb1\n[Install]\nWantedBy=swap.target" | sudo tee /etc/systemd/system/dev-sdb1.swap
+            - systemctl daemon-reload
+            - systemctl enable --now dev-sdb1.swap
+            # cloud-init in rhel8 and rhel9 appear to be based on v21 which doesnt support  write_files.defer :(
+            - chown -R cloud-user:cloud-user /home/cloud-user
+            - subscription-manager register --activationkey=secretkey --org=secretorg --force
+
+  tasks:
+    - name: cleanup tasks
+      tags: clean
+      block:
+      - name: clean up old instances
+        shell:
+          cmd: |
+            virsh destroy {{ item.name }}
+            virsh undefine --nvram {{ item.name }}
+        with_items: '{{ deploy_targets }}'
+        ignore_errors: yes
+        become: true
+        no_log: true    
+
+      - name: clean up old images and cloud-init data
+        file:
+          path: '{{ guest_dir }}/{{ item.name }}.qcow2'
+          state: absent
+        with_items: "{{ deploy_targets }}"
+        no_log: true
+        become: true
+      - file:
+          path: '{{ images_dir }}/{{ item.name }}/'
+          state: absent
+        with_items: "{{ deploy_targets }}"
+        no_log: true
+        become: true
+      - file:
+          path: '{{ guest_dir }}/{{ item.1.name }}'
+          state: absent
+        loop: "{{ deploy_targets | subelements('extra_disk') }}"
+        loop_control:
+          label: "{{ item.0.name }}"
+        no_log: true
+        become: true
+
+    - name: initialize cloud-init folders
+      file:
+        path: '{{ images_dir }}/{{ item.name }}'
+        state: directory
+      with_items: '{{ deploy_targets }}'
+      become: true
+      no_log: true
+      
+    - name: create linked clone from base image for each deploy_target
+      command: qemu-img create -b {{ images_dir }}/{{ os_image }} -f qcow2 -F qcow2 -o {{ item.1.compression | default("compression_type=zstd") }} {{ guest_dir }}/{{ item.name }}.qcow2 {{ item.root_disk_size }}
+      with_items: "{{ deploy_targets }}"
+      become: true
+      no_log: true
+
+    - name: create volumes defined in extra_disk
+      command: qemu-img create -f {{ item.1.type }} {{ item.1.options | default("") }} {{ guest_dir }}/{{ item.1.name }} {{ item.1.size }}
+      loop: "{{ deploy_targets | subelements('extra_disk') }}"
+      loop_control:
+        label: "{{ item.0.name }}"
+      no_log: false
+      become: true
+
+    - name: create cloud-init metadata
+      copy:
+        content: '{{ metadata | default({}) | combine({ "instance-id": fqdn, "local-hostname": fqdn  }) | to_nice_yaml }}'
+        dest: '{{ images_dir }}/{{ item.name }}/meta-data'
+      vars:
+        metadata: {}
+        fqdn: '{{ item.name }}.{{ subdomain }}'
+        ni: ''
+      with_items: '{{ deploy_targets }}'
+      no_log: true
+      become: true
+
+    # when using nocloud datasource in-line nework configuration
+    # can only be performed from meta-data or creating a new file 
+    # called network-config
+    - name: create cloud-init network-config
+      copy:
+        content: '{{ item.network_config }}'
+        dest: '{{ images_dir }}/{{ item.name }}/network-config'
+      with_items: '{{ deploy_targets }}'
+      no_log: true
+      become: true
+
+    - name: Create cloud-init user-data
+      copy:
+        content: '{{ item.user_data | to_nice_yaml }}'
+        dest: '{{ images_dir }}/{{ item.name }}/user-data'
+      with_items: '{{ deploy_targets }}'
+      no_log: true      
+      become: true
+    - lineinfile:
+        path: '{{ images_dir }}/{{ item.name }}/user-data'
+        insertbefore: BOF
+        line: "#cloud-config"
+      with_items: '{{ deploy_targets }}'
+      no_log: true
+      become: true
+
+    - name: Create cloud-init configuration image
+      command: |
+        genisoimage -V cidata -r -J \
+                    -output {{ images_dir }}/{{ item.name }}/{{ item.name }}-cidata.iso \
+                   {{ images_dir }}/{{ item.name }}/user-data \
+                   {{ images_dir }}/{{ item.name }}/meta-data \
+                   {{ images_dir }}/{{ item.name }}/network-config
+
+      with_items: '{{ deploy_targets }}'
+      no_log: true
+      become: true
+
+    - name: Create the VM
+      command: |
+        virt-install
+        --machine {{ item.machine | default("q35") }}
+        --boot uefi
+        --name={{ item.name }}
+        --ram={{ item.memory }}
+        --vcpus={{ item.vcpus }}
+        --controller type=scsi,model=virtio-scsi
+        --import
+        --disk path={{ guest_dir }}/{{ item.name }}.qcow2,bus=scsi,cache=none,discard=unmap,boot.order=1,target=sda,rotation_rate=1
+        {# 
+            this ensures that disks in the extra_disks array are ordered implicitly when the vm boots
+            there is some odd behavior in virtio-scsi where if multiple disks are enumerated with the same
+            target ID that their presentation can shuffle.  By using a unique (incrementing) target for
+            each disk after the first we can create implicit ordering:
+            
+            target 0 = sda
+            target 1 = sdb
+            target 2 = sdc
+            ..
+        #}
+        {% for disk in item.extra_disk %}
+          --disk {{ guest_dir}}/{{ disk.name }},bus=scsi,discard=unmap,rotation_rate=1,cache=none,address.type=drive,address.controller=0,address.bus=0,address.target={{ loop.index0 + 1 }},address.unit=0 
+        {% endfor %}
+        --disk path={{ images_dir }}/{{ item.name }}/{{ item.name }}-cidata.iso,device=cdrom
+        --os-variant {{ os }}
+        {% for nic in item.network %}
+          --network bridge={{ nic }},model=virtio
+        {% endfor %}
+        --rng /dev/urandom
+        --graphics none
+        --serial pty
+        --console pty,target_type=serial
+        --noautoconsole
+      become: true
+      async: 180
+      poll: 0
+      register: virt_install
+      with_items: '{{ deploy_targets }}'
+      no_log: false
+    - async_status: jid={{ item.ansible_job_id }}
+      register: virt_install_jobs
+      until: virt_install_jobs.finished
+      retries: 300
+      with_items: '{{ virt_install.results }}'
+      become: true
+      no_log: false
