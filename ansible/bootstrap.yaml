@@ -1,5 +1,5 @@
 ---
-- name: create rhos-17-1 standalone vm
+- name: create a vm suitable for rhos-17-1 via dev-install
   hosts: localhost
   connection: local
   vars:
@@ -24,14 +24,32 @@
         root_disk_size: 128G
         network:
           - "{{ public_network }}"
+        #### pre_boot_os_customization:
+        # This runs virt-customize on an os disk image before cloud-init
+        # and works around vendor defaults that can have implications for
+        # cloud-init configuration.  For example the rhel9 cloud image sets
+        # net.ifnames=0 at boot which will alter the enumeration of devices
+        # that network_config can manipulate.
+        #
+        # Generally speaking it is better to use cloud-init to perform guest
+        # customiation but there are circumstances like this where you need
+        # a pre-first-time-boot step.
+        #
+        # if this variable is not defined, it will be skipped during bootstrap
+        pre_boot_os_customization: |
+          if grep -q net.ifnames=0 /etc/default/grub;
+          then
+            sed -i 's/net.ifnames=0//g' /etc/default/grub;
+            for f in grub2 grub2-efi;
+            do
+              grub2-mkconfig -o $(readlink -f /etc/$f.cfg);
+            done
+          fi
         network_config:
           version: 2
           renderer: NetworkManager
           ethernets:
-            eth0:
-              match:
-                name: en*
-              set-name: eth0
+            enp1s0:
               addresses:
                 - 10.10.1.5/24
               routes:
@@ -51,12 +69,12 @@
         user_data:
           # groups:
           #  sudo:
-          #    - cloud-user
+          #    - stack
           users:
             - name: root
               lock_passwd: false
               hashed_passwd: "{{ root_password | password_hash('sha512') }}"
-            - name: cloud-user
+            - name: stack
               ssh_authorized_keys:
                 - "{{ ssh_pubkey }}"
               sudo:  'ALL=(ALL) NOPASSWD: ALL'
@@ -73,8 +91,7 @@
             - systemctl daemon-reload
             - systemctl enable --now dev-sdb1.swap
             # cloud-init in rhel8 and rhel9 appear to be based on v21 which doesnt support  write_files.defer :(
-            - chown -R cloud-user:cloud-user /home/cloud-user
-            - subscription-manager register --activationkey=secretkey --org=secretorg --force
+            - chown -R stack:stack /home/stack
 
   tasks:
     - name: cleanup tasks
@@ -131,7 +148,7 @@
       loop: "{{ deploy_targets | subelements('extra_disk') }}"
       loop_control:
         label: "{{ item.0.name }}"
-      no_log: false
+      no_log: true
       become: true
 
     - name: create cloud-init metadata
@@ -157,7 +174,7 @@
       no_log: true
       become: true
 
-    - name: Create cloud-init user-data
+    - name: create cloud-init user-data
       copy:
         content: '{{ item.user_data | to_nice_yaml }}'
         dest: '{{ images_dir }}/{{ item.name }}/user-data'
@@ -184,7 +201,26 @@
       no_log: true
       become: true
 
-    - name: Create the VM
+    - name: Upload and modify grub configuration in VM image
+      command: |
+        virt-customize -a {{ guest_dir }}/{{ item.name }}.qcow2 \
+        --run-command "{{ item.pre_boot_os_customization }}"
+      with_items: '{{ deploy_targets }}'
+      when: item.pre_boot_os_customization is defined and item.pre_boot_os_customization | length > 0
+      register: virt_customize
+      no_log: false
+      async: 180
+      poll: 0
+
+    - async_status: jid={{ item.ansible_job_id }}
+      register: virt_customize_jobs
+      until: virt_customize_jobs.finished
+      retries: 300
+      with_items: '{{ virt_customize.results }}'
+      become: true
+      no_log: false
+
+    - name: create the vm
       command: |
         virt-install
         --machine {{ item.machine | default("q35") }}
@@ -194,20 +230,22 @@
         --vcpus={{ item.vcpus }}
         --controller type=scsi,model=virtio-scsi
         --import
-        --disk path={{ guest_dir }}/{{ item.name }}.qcow2,bus=scsi,cache=none,discard=unmap,boot.order=1,target=sda,rotation_rate=1
+        --disk path={{ guest_dir }}/{{ item.name }}.qcow2,bus=scsi,cache=none,discard=unmap,boot.order=1,rotation_rate=1,address.type=drive,address.controller=0,address.bus=0,address.target=0,address.unit=0
         {# 
             this ensures that disks in the extra_disks array are ordered implicitly when the vm boots
             there is some odd behavior in virtio-scsi where if multiple disks are enumerated with the same
-            target ID that their presentation can shuffle.  By using a unique (incrementing) target for
+            target id that their presentation can shuffle.  By using a unique (incrementing) target/unit for
             each disk after the first we can create implicit ordering:
             
-            target 0 = sda
-            target 1 = sdb
-            target 2 = sdc
+            target 0 / unit 0 = sda
+            target 1 / unit 1 = sdb
+            target 2 / unit 2 = sdc
             ..
+
+            reference: https://bugzilla.redhat.com/show_bug.cgi?id=1815190#c0
         #}
         {% for disk in item.extra_disk %}
-          --disk {{ guest_dir}}/{{ disk.name }},bus=scsi,discard=unmap,rotation_rate=1,cache=none,address.type=drive,address.controller=0,address.bus=0,address.target={{ loop.index0 + 1 }},address.unit=0 
+          --disk {{ guest_dir}}/{{ disk.name }},bus=scsi,discard=unmap,rotation_rate=1,cache=none,address.type=drive,address.controller=0,address.bus=0,address.target={{ loop.index0 + 1 }},address.unit={{ loop.index0 + 1 }}
         {% endfor %}
         --disk path={{ images_dir }}/{{ item.name }}/{{ item.name }}-cidata.iso,device=cdrom
         --os-variant {{ os }}
@@ -224,11 +262,12 @@
       poll: 0
       register: virt_install
       with_items: '{{ deploy_targets }}'
-      no_log: false
+      no_log: true
     - async_status: jid={{ item.ansible_job_id }}
       register: virt_install_jobs
       until: virt_install_jobs.finished
       retries: 300
       with_items: '{{ virt_install.results }}'
       become: true
-      no_log: false
+      no_log: true
+  
