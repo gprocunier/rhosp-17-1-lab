@@ -208,7 +208,7 @@
       with_items: '{{ deploy_targets }}'
       when: item.pre_boot_os_customization is defined and item.pre_boot_os_customization | length > 0
       register: virt_customize
-      no_log: false
+      no_log: true
       async: 180
       poll: 0
 
@@ -218,7 +218,7 @@
       retries: 300
       with_items: '{{ virt_customize.results }}'
       become: true
-      no_log: false
+      no_log: true
 
     - name: create the vm
       command: |
