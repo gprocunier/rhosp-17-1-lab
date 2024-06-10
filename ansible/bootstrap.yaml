@@ -1,10 +1,10 @@
 ---
-- name: create a vm suitable for rhos-17-1 via dev-install
+- name: create rhos-17-1 standalone vm
   hosts: localhost
   connection: local
   vars:
     # change these 3 folders to your deployment
-    project_dir: '/home/greg'
+    project_dir: '/home/someuser'
     # folder with source images
     images_dir: '/images/source'
     # folder with generated vm disks
@@ -24,7 +24,6 @@
         root_disk_size: 128G
         network:
           - "{{ public_network }}"
-        #### pre_boot_os_customization:
         # This runs virt-customize on an os disk image before cloud-init
         # and works around vendor defaults that can have implications for
         # cloud-init configuration.  For example the rhel9 cloud image sets
@@ -67,9 +66,6 @@
             size: 128G
             options: "-o compression_type=zstd"
         user_data:
-          # groups:
-          #  sudo:
-          #    - stack
           users:
             - name: root
               lock_passwd: false
@@ -85,13 +81,14 @@
                 10.10.1.5         rhos-17-1.home.lan rhos-17-1
               append: true
           runcmd:
-            - parted /dev/sdb mklabel gpt mkpart primary linux-swap 0% 100%
-            - mkswap /dev/sdb1
-            - echo -e "[Swap]\nWhat=/dev/sdb1\n[Install]\nWantedBy=swap.target" | sudo tee /etc/systemd/system/dev-sdb1.swap
+            - parted /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_rhos-17-1-swap mklabel gpt mkpart primary linux-swap 0% 100%
+            - mkswap /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_rhos-17-1-swap-part1
+            - echo -e "[Swap]\nWhat=/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_rhos-17-1-swap-part1\n[Install]\nWantedBy=swap.target" | sudo tee /etc/systemd/system/dev-disk-by-id-scsi-0QEMU_QEMU_HARDDISK_rhos-17-1-swap-part1.swap
             - systemctl daemon-reload
-            - systemctl enable --now dev-sdb1.swap
+            - systemctl enable --now dev-/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_rhos-17-1-swap-part1.swap
             # cloud-init in rhel8 and rhel9 appear to be based on v21 which doesnt support  write_files.defer :(
             - chown -R stack:stack /home/stack
+            
 
   tasks:
     - name: cleanup tasks
@@ -230,22 +227,16 @@
         --vcpus={{ item.vcpus }}
         --controller type=scsi,model=virtio-scsi
         --import
-        --disk path={{ guest_dir }}/{{ item.name }}.qcow2,bus=scsi,cache=none,discard=unmap,boot.order=1,rotation_rate=1,address.type=drive,address.controller=0,address.bus=0,address.target=0,address.unit=0
-        {# 
-            this ensures that disks in the extra_disks array are ordered implicitly when the vm boots
-            there is some odd behavior in virtio-scsi where if multiple disks are enumerated with the same
-            target id that their presentation can shuffle.  By using a unique (incrementing) target/unit for
-            each disk after the first we can create implicit ordering:
-            
-            target 0 / unit 0 = sda
-            target 1 / unit 1 = sdb
-            target 2 / unit 2 = sdc
-            ..
+        {#
+          virtio-scsi disks are unstable since changes related to this patch:
 
-            reference: https://bugzilla.redhat.com/show_bug.cgi?id=1815190#c0
+            https://github.com/libguestfs/libguestfs/commit/bca9b94fc593771b3801b09b95e477f160517909
+
+          We need to use wwn / serial to identify the disk meant for SWAP and CEPH
         #}
+        --disk path={{ guest_dir }}/{{ item.name }}.qcow2,bus=scsi,cache=none,discard=unmap,boot.order=1,wwn=rotation_rate=1,wwn={{ "0xDEADBEEF" ~ '%08X' % 0 }},serial={{ item.name }}
         {% for disk in item.extra_disk %}
-          --disk {{ guest_dir}}/{{ disk.name }},bus=scsi,discard=unmap,rotation_rate=1,cache=none,address.type=drive,address.controller=0,address.bus=0,address.target={{ loop.index0 + 1 }},address.unit={{ loop.index0 + 1 }}
+          --disk {{ guest_dir}}/{{ disk.name }},bus=scsi,discard=unmap,rotation_rate=1,cache=none,wwn={{ "0xDEADBEEF" ~ '%08X' % (loop.index0 + 1) }},serial={{ disk.name.split('.')[0] }}
         {% endfor %}
         --disk path={{ images_dir }}/{{ item.name }}/{{ item.name }}-cidata.iso,device=cdrom
         --os-variant {{ os }}
